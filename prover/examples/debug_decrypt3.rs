@@ -1,0 +1,396 @@
+//! Test our AES-256-GCM against known test vectors.
+//! Run with: cargo run --example debug_decrypt3
+
+use anyhow::Result;
+use hkdf::Hkdf;
+use sha2::Sha384;
+use tls_capture::capture_tls_session;
+
+const SBOX: [u8; 256] = [
+    0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
+    0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0, 0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0,
+    0xb7, 0xfd, 0x93, 0x26, 0x36, 0x3f, 0xf7, 0xcc, 0x34, 0xa5, 0xe5, 0xf1, 0x71, 0xd8, 0x31, 0x15,
+    0x04, 0xc7, 0x23, 0xc3, 0x18, 0x96, 0x05, 0x9a, 0x07, 0x12, 0x80, 0xe2, 0xeb, 0x27, 0xb2, 0x75,
+    0x09, 0x83, 0x2c, 0x1a, 0x1b, 0x6e, 0x5a, 0xa0, 0x52, 0x3b, 0xd6, 0xb3, 0x29, 0xe3, 0x2f, 0x84,
+    0x53, 0xd1, 0x00, 0xed, 0x20, 0xfc, 0xb1, 0x5b, 0x6a, 0xcb, 0xbe, 0x39, 0x4a, 0x4c, 0x58, 0xcf,
+    0xd0, 0xef, 0xaa, 0xfb, 0x43, 0x4d, 0x33, 0x85, 0x45, 0xf9, 0x02, 0x7f, 0x50, 0x3c, 0x9f, 0xa8,
+    0x51, 0xa3, 0x40, 0x8f, 0x92, 0x9d, 0x38, 0xf5, 0xbc, 0xb6, 0xda, 0x21, 0x10, 0xff, 0xf3, 0xd2,
+    0xcd, 0x0c, 0x13, 0xec, 0x5f, 0x97, 0x44, 0x17, 0xc4, 0xa7, 0x7e, 0x3d, 0x64, 0x5d, 0x19, 0x73,
+    0x60, 0x81, 0x4f, 0xdc, 0x22, 0x2a, 0x90, 0x88, 0x46, 0xee, 0xb8, 0x14, 0xde, 0x5e, 0x0b, 0xdb,
+    0xe0, 0x32, 0x3a, 0x0a, 0x49, 0x06, 0x24, 0x5c, 0xc2, 0xd3, 0xac, 0x62, 0x91, 0x95, 0xe4, 0x79,
+    0xe7, 0xc8, 0x37, 0x6d, 0x8d, 0xd5, 0x4e, 0xa9, 0x6c, 0x56, 0xf4, 0xea, 0x65, 0x7a, 0xae, 0x08,
+    0xba, 0x78, 0x25, 0x2e, 0x1c, 0xa6, 0xb4, 0xc6, 0xe8, 0xdd, 0x74, 0x1f, 0x4b, 0xbd, 0x8b, 0x8a,
+    0x70, 0x3e, 0xb5, 0x66, 0x48, 0x03, 0xf6, 0x0e, 0x61, 0x35, 0x57, 0xb9, 0x86, 0xc1, 0x1d, 0x9e,
+    0xe1, 0xf8, 0x98, 0x11, 0x69, 0xd9, 0x8e, 0x94, 0x9b, 0x1e, 0x87, 0xe9, 0xce, 0x55, 0x28, 0xdf,
+    0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16,
+];
+
+struct Aes256 {
+    round_keys: [u8; 240],
+}
+
+impl Aes256 {
+    fn new(key: &[u8; 32]) -> Self {
+        let mut rk = [0u8; 240];
+        rk[..32].copy_from_slice(key);
+        let mut i = 8;
+        while i < 60 {
+            let mut temp = [0u8; 4];
+            let prev = (i - 1) * 4;
+            temp.copy_from_slice(&rk[prev..prev + 4]);
+            if i % 8 == 0 {
+                let t = temp[0];
+                temp[0] = temp[1];
+                temp[1] = temp[2];
+                temp[2] = temp[3];
+                temp[3] = t;
+                for j in 0..4 {
+                    temp[j] = SBOX[temp[j] as usize];
+                }
+                temp[0] ^=
+                    [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36][(i / 8) - 1];
+            } else if i % 8 == 4 {
+                for j in 0..4 {
+                    temp[j] = SBOX[temp[j] as usize];
+                }
+            }
+            let prev2 = (i - 8) * 4;
+            for j in 0..4 {
+                rk[i * 4 + j] = rk[prev2 + j] ^ temp[j];
+            }
+            i += 1;
+        }
+        Self { round_keys: rk }
+    }
+
+    fn encrypt_block(&self, block: &mut [u8; 16]) {
+        let mut s = *block;
+        for i in 0..16 {
+            s[i] ^= self.round_keys[i];
+        }
+        for round in 1..=13 {
+            for i in 0..16 {
+                s[i] = SBOX[s[i] as usize];
+            }
+            let t = s[1];
+            s[1] = s[5];
+            s[5] = s[9];
+            s[9] = s[13];
+            s[13] = t;
+            let t0 = s[2];
+            let t1 = s[6];
+            s[2] = s[10];
+            s[6] = s[14];
+            s[10] = t0;
+            s[14] = t1;
+            let t = s[15];
+            s[15] = s[11];
+            s[11] = s[7];
+            s[7] = s[3];
+            s[3] = t;
+            for i in 0..4 {
+                let o = i * 4;
+                let a = s[o];
+                let b = s[o + 1];
+                let c = s[o + 2];
+                let d = s[o + 3];
+                s[o] = gmul(a, 2) ^ gmul(b, 3) ^ c ^ d;
+                s[o + 1] = a ^ gmul(b, 2) ^ gmul(c, 3) ^ d;
+                s[o + 2] = a ^ b ^ gmul(c, 2) ^ gmul(d, 3);
+                s[o + 3] = gmul(a, 3) ^ b ^ c ^ gmul(d, 2);
+            }
+            let off = round * 16;
+            for i in 0..16 {
+                s[i] ^= self.round_keys[off + i];
+            }
+        }
+        for i in 0..16 {
+            s[i] = SBOX[s[i] as usize];
+        }
+        let t = s[1];
+        s[1] = s[5];
+        s[5] = s[9];
+        s[9] = s[13];
+        s[13] = t;
+        let t0 = s[2];
+        let t1 = s[6];
+        s[2] = s[10];
+        s[6] = s[14];
+        s[10] = t0;
+        s[14] = t1;
+        let t = s[15];
+        s[15] = s[11];
+        s[11] = s[7];
+        s[7] = s[3];
+        s[3] = t;
+        for i in 0..16 {
+            s[i] ^= self.round_keys[224 + i];
+        }
+        *block = s;
+    }
+}
+
+fn gmul(mut a: u8, mut b: u8) -> u8 {
+    let mut r = 0u8;
+    for _ in 0..8 {
+        if b & 1 != 0 {
+            r ^= a;
+        }
+        let h = a & 0x80;
+        a <<= 1;
+        if h != 0 {
+            a ^= 0x1b;
+        }
+        b >>= 1;
+    }
+    r
+}
+
+fn ghash(h: &[u8; 16], data: &[u8]) -> [u8; 16] {
+    let mut y = [0u8; 16];
+    for chunk in data.chunks(16) {
+        for i in 0..chunk.len() {
+            y[i] ^= chunk[i];
+        }
+        y = gmul128(&y, h);
+    }
+    y
+}
+
+fn gmul128(x: &[u8; 16], y: &[u8; 16]) -> [u8; 16] {
+    let mut z = [0u8; 16];
+    let mut v = *y;
+    for i in 0..128 {
+        if x[i / 8] & (1 << (7 - i % 8)) != 0 {
+            for j in 0..16 {
+                z[j] ^= v[j];
+            }
+        }
+        let lsb = v[15] & 1;
+        for j in (1..16).rev() {
+            v[j] = (v[j] >> 1) | (v[j - 1] << 7);
+        }
+        v[0] >>= 1;
+        if lsb != 0 {
+            v[0] ^= 0xe1;
+        }
+    }
+    z
+}
+
+fn aes256_gcm_decrypt(key: &[u8; 32], nonce: &[u8; 12], aad: &[u8], ct: &[u8]) -> Option<Vec<u8>> {
+    if ct.len() < 16 {
+        return None;
+    }
+    let ct_len = ct.len() - 16;
+    let cipher = Aes256::new(key);
+    let mut h = [0u8; 16];
+    cipher.encrypt_block(&mut h);
+
+    let mut gi = Vec::new();
+    gi.extend_from_slice(aad);
+    let ap = (16 - (aad.len() % 16)) % 16;
+    gi.extend(std::iter::repeat(0u8).take(ap));
+    gi.extend_from_slice(&ct[..ct_len]);
+    let cp = (16 - (ct_len % 16)) % 16;
+    gi.extend(std::iter::repeat(0u8).take(cp));
+    gi.extend_from_slice(&(aad.len() as u64 * 8).to_be_bytes());
+    gi.extend_from_slice(&(ct_len as u64 * 8).to_be_bytes());
+
+    let computed = ghash(&h, &gi);
+    let mut j0 = [0u8; 16];
+    j0[..12].copy_from_slice(nonce);
+    j0[15] = 1;
+    cipher.encrypt_block(&mut j0);
+    let mut expected = [0u8; 16];
+    for i in 0..16 {
+        expected[i] = computed[i] ^ j0[i];
+    }
+
+    let mut diff = 0u8;
+    for i in 0..16 {
+        diff |= expected[i] ^ ct[ct_len + i];
+    }
+    if diff != 0 {
+        return None;
+    }
+
+    let mut pt = Vec::with_capacity(ct_len);
+    let mut counter = 2u32;
+    for chunk in ct[..ct_len].chunks(16) {
+        let mut cb = [0u8; 16];
+        cb[..12].copy_from_slice(nonce);
+        cb[12..16].copy_from_slice(&counter.to_be_bytes());
+        cipher.encrypt_block(&mut cb);
+        for (i, &b) in chunk.iter().enumerate() {
+            pt.push(b ^ cb[i]);
+        }
+        counter += 1;
+    }
+    Some(pt)
+}
+
+fn derive_key_iv(secret: &[u8], use_from_prk: bool) -> ([u8; 32], [u8; 12]) {
+    let hkdf = if use_from_prk {
+        Hkdf::<Sha384>::from_prk(secret).expect("from_prk failed")
+    } else {
+        Hkdf::<Sha384>::new(None, secret)
+    };
+    let mut key = [0u8; 32];
+    let mut iv = [0u8; 12];
+    // hkdflabel adds "tls13 " prefix, so pass just "key" and "iv"
+    hkdf.expand(&hkdflabel(b"key", b"", 32), &mut key).unwrap();
+    hkdf.expand(&hkdflabel(b"iv", b"", 12), &mut iv).unwrap();
+    (key, iv)
+}
+
+fn hkdflabel(label: &[u8], ctx: &[u8], len: u16) -> Vec<u8> {
+    let mut v = Vec::new();
+    v.extend_from_slice(&len.to_be_bytes());
+    let f = [b"tls13 ", label].concat();
+    v.push(f.len() as u8);
+    v.extend_from_slice(&f);
+    v.push(ctx.len() as u8);
+    v.extend_from_slice(ctx);
+    v
+}
+
+fn parse_tls_records(data: &[u8]) -> Vec<(u8, u16, &[u8])> {
+    let mut records = Vec::new();
+    let mut offset = 0;
+    while offset + 5 <= data.len() {
+        let content_type = data[offset];
+        let version = u16::from_be_bytes([data[offset + 1], data[offset + 2]]);
+        let length = u16::from_be_bytes([data[offset + 3], data[offset + 4]]) as usize;
+        if offset + 5 + length > data.len() {
+            break;
+        }
+        records.push((
+            content_type,
+            version,
+            &data[offset + 5..offset + 5 + length],
+        ));
+        offset += 5 + length;
+    }
+    records
+}
+
+fn main() -> Result<()> {
+    // Test AES-256 with known test vector (from NIST)
+    println!("=== AES-256 Known Answer Test ===");
+    let key: [u8; 32] = [
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+        0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
+        0x1e, 0x1f,
+    ];
+    let plaintext: [u8; 16] = [
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
+        0xff,
+    ];
+    let expected: [u8; 16] = [
+        0x8e, 0xa2, 0xb7, 0xca, 0x51, 0x67, 0x45, 0xbf, 0xea, 0xfc, 0x49, 0x90, 0x4b, 0x49, 0x60,
+        0x89,
+    ];
+
+    let cipher = Aes256::new(&key);
+    let mut block = plaintext;
+    cipher.encrypt_block(&mut block);
+    println!("Expected: {}", hex::encode(expected));
+    println!("Got:      {}", hex::encode(block));
+    println!("Match: {}", block == expected);
+
+    if block != expected {
+        println!("AES-256 implementation is WRONG!");
+        return Ok(());
+    }
+    println!("AES-256 implementation is CORRECT!\n");
+
+    // Now test TLS decryption
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let url = "https://api.github.com/repos/succinctlabs/sp1";
+        let field = "stargazers_count";
+
+        println!("Capturing TLS session...");
+        let (session, _response_body) = capture_tls_session(url, field).await?;
+
+        let records = parse_tls_records(&session.encrypted_records);
+        println!("Parsed {} records", records.len());
+
+        // Find the first type 23 record after ChangeCipherSpec
+        let mut ccs_seen = false;
+        for (i, (ct, ver, data)) in records.iter().enumerate() {
+            if *ct == 20 {
+                ccs_seen = true;
+                continue;
+            }
+            if !ccs_seen {
+                continue;
+            }
+            if *ct != 23 {
+                continue;
+            }
+
+            println!("\n=== Record {}: type={} len={} ===", i, ct, data.len());
+            println!(
+                "First 32 bytes of ciphertext: {}",
+                hex::encode(&data[..32.min(data.len())])
+            );
+
+            // Test both HKDF approaches
+            for &use_from_prk in &[true, false] {
+                let (key, iv) =
+                    derive_key_iv(&session.server_handshake_traffic_secret, use_from_prk);
+
+                println!(
+                    "\n  Approach: {}",
+                    if use_from_prk {
+                        "from_prk"
+                    } else {
+                        "new(None)"
+                    }
+                );
+                println!("  Key: {}", hex::encode(key));
+                println!("  IV:  {}", hex::encode(iv));
+
+                // Build nonce for seq=0
+                let seq: u64 = 0;
+                let seq_bytes = seq.to_be_bytes();
+                let mut nonce = iv;
+                for j in 0..8 {
+                    nonce[4 + j] ^= seq_bytes[j];
+                }
+                println!("  Nonce (seq=0): {}", hex::encode(nonce));
+
+                // Build AAD
+                let data_len = data.len() as u16;
+                let mut aad = Vec::new();
+                aad.extend_from_slice(&seq_bytes);
+                aad.push(*ct);
+                aad.extend_from_slice(&ver.to_be_bytes());
+                aad.extend_from_slice(&data_len.to_be_bytes());
+                println!("  AAD ({} bytes): {}", aad.len(), hex::encode(&aad));
+
+                match aes256_gcm_decrypt(&key, &nonce, &aad, data) {
+                    Some(pt) => {
+                        let inner_type = pt.last().copied().unwrap_or(0);
+                        println!(
+                            "  Result: DECRYPTED! inner_type={} pt_len={}",
+                            inner_type,
+                            pt.len()
+                        );
+                        println!("  First 20 bytes: {}", hex::encode(&pt[..20.min(pt.len())]));
+                    }
+                    None => {
+                        println!("  Result: FAILED (tag mismatch)");
+                    }
+                }
+            }
+
+            // Only test first record
+            break;
+        }
+
+        Ok(())
+    })
+}

@@ -1,0 +1,61 @@
+[package]
+name = "agent-marketplace-prover"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "amp-prover"
+path = "src/main.rs"
+
+[[example]]
+name = "debug_decrypt"
+path = "examples/debug_decrypt.rs"
+
+[[example]]
+name = "debug_decrypt2"
+path = "examples/debug_decrypt2.rs"
+
+[[example]]
+name = "debug_decrypt3"
+path = "examples/debug_decrypt3.rs"
+
+[[example]]
+name = "debug_hkdf"
+path = "examples/debug_hkdf.rs"
+
+[[example]]
+name = "debug_aes"
+path = "examples/debug_aes.rs"
+
+[dependencies]
+# SP1 SDK for proving
+sp1-sdk = { version = "6.0", features = ["native-gnark"] }
+
+# TLS capture
+tls-capture = { path = "tls-capture" }
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "1"
+hex = "0.4"
+sha2 = "0.10"
+hkdf = "0.12"
+hmac = "0.12"
+aes-gcm = "0.10"
+
+# Big integer for precomputing modular inverses
+num-bigint = "0.4"
+num-traits = "0.2"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Error handling
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
