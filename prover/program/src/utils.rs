@@ -11,9 +11,57 @@ pub fn parse_http_response(data: &[u8]) -> Option<&str> {
     Some(&resp[start + 4..])
 }
 
+/// Extract a top-level numeric JSON field without running the full
+/// `serde_json` parser (which is expensive inside the zkVM). Scans for
+/// `"\"key\""` followed by `:` and a u64 literal.
 pub fn extract_json_field(body: &str, path: &str) -> Option<u64> {
-    let json: serde_json::Value = serde_json::from_str(body).ok()?;
-    json.get(path)?.as_u64()
+    // Build the needle `"path"` so we don't match substrings of other keys.
+    let mut needle = String::with_capacity(path.len() + 2);
+    needle.push('"');
+    needle.push_str(path);
+    needle.push('"');
+
+    let mut search_from = 0;
+    loop {
+        let key_pos = body[search_from..].find(&needle)?;
+        let abs_pos = search_from + key_pos;
+        // Skip past the key itself.
+        let mut p = abs_pos + needle.len();
+        let bytes = body.as_bytes();
+        // Skip whitespace and exactly one ':'.
+        while p < bytes.len()
+            && (bytes[p] == b' ' || bytes[p] == b'\t' || bytes[p] == b'\n' || bytes[p] == b'\r')
+        {
+            p += 1;
+        }
+        if p >= bytes.len() || bytes[p] != b':' {
+            search_from = abs_pos + needle.len();
+            continue;
+        }
+        p += 1;
+        while p < bytes.len()
+            && (bytes[p] == b' ' || bytes[p] == b'\t' || bytes[p] == b'\n' || bytes[p] == b'\r')
+        {
+            p += 1;
+        }
+        // Parse an optional sign then digits.
+        let start = p;
+        if p < bytes.len() && (bytes[p] == b'-' || bytes[p] == b'+') {
+            p += 1;
+        }
+        let digit_start = p;
+        while p < bytes.len() && bytes[p].is_ascii_digit() {
+            p += 1;
+        }
+        if p == digit_start {
+            // Hit the key but the value wasn't a number (e.g. nested object).
+            // Continue searching for another occurrence.
+            search_from = abs_pos + needle.len();
+            continue;
+        }
+        let parsed = body[start..p].parse::<u64>().ok()?;
+        return Some(parsed);
+    }
 }
 
 // ============================================================

@@ -14,7 +14,7 @@ sp1_zkvm::entrypoint!(main);
 
 use sha2::{Digest, Sha256};
 
-use crate::aes_256::aes256_gcm_decrypt;
+use crate::aes_256::{aes256_gcm_decrypt_with_cipher, Aes256};
 use crate::ecdsa::verify_ecdsa_p256;
 use crate::tls_record::{
     parse_tls_records, TlsRecord, CONTENT_TYPE_APPLICATION_DATA, CONTENT_TYPE_HANDSHAKE,
@@ -58,14 +58,12 @@ fn verify_cert_chain(certs: &[Vec<u8>], expected_root_spki_hash: &[u8; 32]) -> b
         let root_hash = Sha256::digest(&root_spki);
         let root_hash_arr: [u8; 32] = root_hash.into();
         if root_hash_arr != *expected_root_spki_hash {
-            println!("verify_cert_chain: root SPKI hash mismatch");
             return false;
         }
+        true
     } else {
-        println!("verify_cert_chain: failed to extract root SPKI");
-        return false;
+        false
     }
-    true
 }
 
 // ============================================================
@@ -78,16 +76,13 @@ fn verify_tls_handshake(
     expected_root_spki_hash: &[u8; 32],
 ) -> bool {
     if server_cert_chain.is_empty() {
-        println!("verify_tls_handshake: empty cert chain");
         return false;
     }
     if !verify_cert_chain(server_cert_chain, expected_root_spki_hash) {
-        println!("verify_tls_handshake: cert chain verification failed");
         return false;
     }
     let mut found_cert_verify = false;
-    for (ri, record_data) in handshake_records.iter().enumerate() {
-        println!("  handshake record[{}]: {} bytes", ri, record_data.len());
+    for record_data in handshake_records.iter() {
         let mut offset = 0;
         while offset + 4 <= record_data.len() {
             let msg_type = record_data[offset];
@@ -98,22 +93,13 @@ fn verify_tls_handshake(
                 record_data[offset + 3],
             ]) as usize;
             if offset + 4 + msg_len > record_data.len() {
-                println!(
-                    "    malformed message at offset {}, msg_type={}, msg_len={}",
-                    offset, msg_type, msg_len
-                );
                 break;
             }
-            println!("    msg_type={}, msg_len={}", msg_type, msg_len);
             if msg_type == HANDSHAKE_TYPE_CERTIFICATE_VERIFY {
-                println!("    → FOUND CertificateVerify!");
                 found_cert_verify = true;
             }
             offset += 4 + msg_len;
         }
-    }
-    if !found_cert_verify {
-        println!("verify_tls_handshake: CertificateVerify not found");
     }
     found_cert_verify
 }
@@ -122,12 +108,15 @@ fn verify_tls_handshake(
 //  TLS Record Decryption Helper
 // ============================================================
 
-/// Decrypt a single TLS record. Returns (plaintext, inner_content_type) or None.
-fn decrypt_record(
-    key: &[u8; 32],
+/// Decrypt a single TLS record using a pre-built cipher (avoids redoing the
+/// AES-256 key schedule per record). Returns (plaintext, inner_content_type)
+/// or None.
+fn decrypt_record_with_cipher(
+    cipher: &Aes256,
     iv: &[u8; 12],
     seq: u64,
     record: &TlsRecord,
+    scratch: &mut Vec<u8>,
 ) -> Option<(Vec<u8>, u8)> {
     let seq_bytes = seq.to_be_bytes();
     let mut nonce = *iv;
@@ -142,7 +131,7 @@ fn decrypt_record(
     aad[2] = 3;
     aad[3..5].copy_from_slice(&data_len.to_be_bytes());
 
-    let pt = aes256_gcm_decrypt(key, &nonce, &aad, record.data)?;
+    let pt = aes256_gcm_decrypt_with_cipher(cipher, &nonce, &aad, record.data, scratch)?;
     if pt.is_empty() {
         return None;
     }
@@ -172,31 +161,19 @@ pub fn main() {
     let server_name: String = sp1_zkvm::io::read();
     let response_body_fallback: Vec<u8> = sp1_zkvm::io::read();
 
-    println!("encrypted_records len: {}", encrypted_records.len());
-    println!("cert chain: {} certs", server_cert_chain.len());
-    println!("hs_secret len: {}", server_hs_traffic_secret.len());
-    println!("app_secret len: {}", server_app_traffic_secret.len());
-
     // ── Derive keys ─────────────────────────────────────────────
     let (hs_key, hs_iv) = derive_key_iv(&server_hs_traffic_secret);
     let (app_key, app_iv) = derive_key_iv(&server_app_traffic_secret);
-    println!("hs_key: {:02x?}", hs_key);
-    println!("hs_iv: {:02x?}", hs_iv);
-    println!("app_key: {:02x?}", app_key);
-    println!("app_iv: {:02x?}", app_iv);
+
+    // Build the AES-256 ciphers once per key. The key schedule is the same for
+    // every record encrypted under that key, so doing it once here instead of
+    // inside each decrypt saves N key schedules per phase.
+    let hs_cipher = Aes256::new(&hs_key);
+    let app_cipher = Aes256::new(&app_key);
+    let mut scratch = Vec::with_capacity(1024);
 
     // ── Parse & decrypt TLS records ─────────────────────────────
     let records = parse_tls_records(&encrypted_records);
-    println!("parsed {} records", records.len());
-    for (i, r) in records.iter().enumerate() {
-        println!(
-            "  record[{}]: type={}, version={:04x}, len={}",
-            i,
-            r.content_type,
-            r.version,
-            r.data.len()
-        );
-    }
     let mut decrypted_handshake = Vec::new();
     let mut decrypted_response = Vec::new();
     let mut hs_seq: u64 = 0;
@@ -206,59 +183,53 @@ pub fn main() {
 
     for record in &records {
         if record.content_type == 20 {
-            println!("  → ChangeCipherSpec, activating handshake keys");
+            // ChangeCipherSpec — activates handshake keys.
             handshake_keys_active = true;
             continue;
         }
         if !handshake_keys_active {
             if record.content_type == CONTENT_TYPE_HANDSHAKE {
-                println!("  → plaintext handshake record, len={}", record.data.len());
                 decrypted_handshake.push(record.data.to_vec());
             }
             continue;
         }
 
         if handshake_phase {
-            if let Some((data, inner_type)) = decrypt_record(&hs_key, &hs_iv, hs_seq, record) {
-                println!(
-                    "  → decrypted with hs_key seq={}, inner_type={}, data_len={}",
-                    hs_seq,
-                    inner_type,
-                    data.len()
-                );
+            // Try the handshake key first. If it succeeds the inner type tells
+            // us whether to keep using hs_key (more handshake messages) or
+            // whether the server has switched to application data.
+            if let Some((data, inner_type)) =
+                decrypt_record_with_cipher(&hs_cipher, &hs_iv, hs_seq, record, &mut scratch)
+            {
                 hs_seq += 1;
                 if inner_type == CONTENT_TYPE_HANDSHAKE {
                     decrypted_handshake.push(data);
                     continue;
                 } else {
+                    // First application-data record happened to decrypt under
+                    // hs_key (unusual but defensive): switch phase and keep it.
                     handshake_phase = false;
                     decrypted_response.extend_from_slice(&data);
                     continue;
                 }
-            } else {
-                println!("  → hs_key decryption FAILED for seq={}", hs_seq);
             }
+            // hs_key failed → server has switched to application traffic keys.
+            // Don't retry hs_key for subsequent records; go straight to app_key.
+            handshake_phase = false;
         }
-        if let Some((data, inner_type)) = decrypt_record(&app_key, &app_iv, app_seq, record) {
-            println!(
-                "  → decrypted with app_key seq={}, inner_type={}, data_len={}",
-                app_seq,
-                inner_type,
-                data.len()
-            );
+
+        if let Some((data, inner_type)) =
+            decrypt_record_with_cipher(&app_cipher, &app_iv, app_seq, record, &mut scratch)
+        {
             app_seq += 1;
             if inner_type == CONTENT_TYPE_APPLICATION_DATA {
                 decrypted_response.extend_from_slice(&data);
-            } else if inner_type == CONTENT_TYPE_HANDSHAKE && handshake_phase {
+            } else if inner_type == CONTENT_TYPE_HANDSHAKE {
                 decrypted_handshake.push(data);
             }
-        } else {
-            println!("  → app_key decryption FAILED for seq={}", app_seq);
         }
+        // If app_key also fails, the record is undecryptable; skip it.
     }
-
-    println!("decrypted_handshake: {} records", decrypted_handshake.len());
-    println!("decrypted_response: {} bytes", decrypted_response.len());
 
     // ── Extract field ───────────────────────────────────────────
     let http_body = if !decrypted_response.is_empty() {
@@ -278,26 +249,11 @@ pub fn main() {
     sp1_zkvm::io::commit(&expected_root_spki_hash);
 
     // ── Verify TLS handshake ────────────────────────────────────
-    println!("Calling verify_tls_handshake...");
-    println!("  handshake records: {}", decrypted_handshake.len());
-    for (i, h) in decrypted_handshake.iter().enumerate() {
-        println!(
-            "  record[{}]: {} bytes, first bytes: {:02x?}",
-            i,
-            h.len(),
-            &h[..h.len().min(16)]
-        );
-    }
-    println!("  cert chain: {}", server_cert_chain.len());
-    for (i, c) in server_cert_chain.iter().enumerate() {
-        println!("  cert[{}]: {} bytes", i, c.len());
-    }
     let result = verify_tls_handshake(
         &decrypted_handshake,
         &server_cert_chain,
         &expected_root_spki_hash,
     );
-    println!("verify_tls_handshake result: {}", result);
     if !result {
         panic!("TLS handshake verification failed");
     }

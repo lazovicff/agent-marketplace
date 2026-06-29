@@ -178,32 +178,50 @@ fn gmul128(x: &[u8; 16], y: &[u8; 16]) -> [u8; 16] {
     z
 }
 
+#[allow(dead_code)]
 pub fn aes256_gcm_decrypt(
     key: &[u8; 32],
     nonce: &[u8; 12],
     aad: &[u8],
     ct: &[u8],
 ) -> Option<Vec<u8>> {
+    let cipher = Aes256::new(key);
+    let mut scratch = Vec::with_capacity(1024);
+    aes256_gcm_decrypt_with_cipher(&cipher, nonce, aad, ct, &mut scratch)
+}
+
+/// AES-256-GCM decrypt using a pre-built cipher (key schedule already done)
+/// and a caller-provided scratch buffer for the GHASH input. Reusing both
+/// across records avoids redoing the key schedule and per-record heap
+/// allocations.
+pub fn aes256_gcm_decrypt_with_cipher(
+    cipher: &Aes256,
+    nonce: &[u8; 12],
+    aad: &[u8],
+    ct: &[u8],
+    scratch: &mut Vec<u8>,
+) -> Option<Vec<u8>> {
     if ct.len() < 16 {
         return None;
     }
     let tag_len = 16;
     let ct_len = ct.len() - tag_len;
-    let cipher = Aes256::new(key);
     let mut h = [0u8; 16];
     cipher.encrypt_block(&mut h);
 
-    let mut gi = Vec::new();
-    gi.extend_from_slice(aad);
+    // Build the GHASH input (AAD || pad || CT || pad || lengths) in the reused
+    // scratch buffer instead of allocating a fresh Vec per record.
+    scratch.clear();
+    scratch.extend_from_slice(aad);
     let ap = (16 - (aad.len() % 16)) % 16;
-    gi.extend(std::iter::repeat(0u8).take(ap));
-    gi.extend_from_slice(&ct[..ct_len]);
+    scratch.extend(std::iter::repeat(0u8).take(ap));
+    scratch.extend_from_slice(&ct[..ct_len]);
     let cp = (16 - (ct_len % 16)) % 16;
-    gi.extend(std::iter::repeat(0u8).take(cp));
-    gi.extend_from_slice(&(aad.len() as u64 * 8).to_be_bytes());
-    gi.extend_from_slice(&(ct_len as u64 * 8).to_be_bytes());
+    scratch.extend(std::iter::repeat(0u8).take(cp));
+    scratch.extend_from_slice(&(aad.len() as u64 * 8).to_be_bytes());
+    scratch.extend_from_slice(&(ct_len as u64 * 8).to_be_bytes());
 
-    let computed = ghash(&h, &gi);
+    let computed = ghash(&h, scratch);
     let mut j0 = [0u8; 16];
     j0[..12].copy_from_slice(nonce);
     j0[15] = 1;
