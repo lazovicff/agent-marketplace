@@ -135,18 +135,6 @@ async fn cmd_prove(output: &PathBuf, context: &str, url: &str, field: &str) -> R
 
     stdin.write(&session_data.field_path);
     stdin.write(&session_data.server_name);
-    let full_response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{}",
-        response_body
-    );
-    stdin.write(&full_response.as_bytes().to_vec());
-
-    let json: serde_json::Value = serde_json::from_str(&response_body)?;
-    let field_value = json
-        .get(field)
-        .and_then(|v| v.as_u64())
-        .with_context(|| format!("Field '{}' not found", field))?;
-    println!("  ✓ {} = {}", field, field_value);
 
     println!("\n[2/3] Setting up MockProver for cycle count...");
     let prover = MockProver::new().await;

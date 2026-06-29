@@ -159,7 +159,6 @@ pub fn main() {
     let expected_root_spki_hash: [u8; 32] = sp1_zkvm::io::read();
     let field_path: String = sp1_zkvm::io::read();
     let server_name: String = sp1_zkvm::io::read();
-    let response_body_fallback: Vec<u8> = sp1_zkvm::io::read();
 
     // ── Derive keys ─────────────────────────────────────────────
     let (hs_key, hs_iv) = derive_key_iv(&server_hs_traffic_secret);
@@ -232,12 +231,8 @@ pub fn main() {
     }
 
     // ── Extract field ───────────────────────────────────────────
-    let http_body = if !decrypted_response.is_empty() {
-        parse_http_response(&decrypted_response)
-    } else {
-        parse_http_response(&response_body_fallback)
-    }
-    .expect("Failed to parse HTTP response");
+    let http_body =
+        parse_http_response(&decrypted_response).expect("Failed to parse HTTP response");
 
     let field_value =
         extract_json_field(http_body, &field_path).expect("Failed to extract field from JSON");

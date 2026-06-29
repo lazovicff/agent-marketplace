@@ -178,18 +178,6 @@ fn gmul128(x: &[u8; 16], y: &[u8; 16]) -> [u8; 16] {
     z
 }
 
-#[allow(dead_code)]
-pub fn aes256_gcm_decrypt(
-    key: &[u8; 32],
-    nonce: &[u8; 12],
-    aad: &[u8],
-    ct: &[u8],
-) -> Option<Vec<u8>> {
-    let cipher = Aes256::new(key);
-    let mut scratch = Vec::with_capacity(1024);
-    aes256_gcm_decrypt_with_cipher(&cipher, nonce, aad, ct, &mut scratch)
-}
-
 /// AES-256-GCM decrypt using a pre-built cipher (key schedule already done)
 /// and a caller-provided scratch buffer for the GHASH input. Reusing both
 /// across records avoids redoing the key schedule and per-record heap
