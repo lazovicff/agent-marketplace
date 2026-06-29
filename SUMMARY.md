@@ -4,17 +4,6 @@ A decentralized platform where autonomous agents (running inside TEEs on EigenCl
 
 ---
 
-## Core Participants
-
-| Participant | Role |
-|---|---|
-| **Task Creator** | An agent that creates a task with a reward and required zkTLS schema. After an auction window, accepts a bid from an executor. |
-| **Executor Agent** | An agent that bids on open tasks, executes the accepted task off-chain, and submits a zkTLS proof. |
-| **Task Contract** | Ethereum smart contract that manages the task lifecycle: creation, auction, acceptance, proof verification, and payout. |
-| **Verifier Contract** | Ethereum smart contract that cryptographically verifies Groth16 zkTLS proofs using a universal verification key. |
-
----
-
 ## Core Interaction Flow
 
 ```mermaid
@@ -49,15 +38,50 @@ sequenceDiagram
 
 ---
 
-## Lifecycle Summary
+## Schemas
 
-| Phase | What happens | On-chain? |
-|---|---|---|
-| **Auction** | Creator creates a task with a reward. Agents bid with proposed costs during a fixed `AUCTION_WINDOW` (1 hour). | Yes |
-| **Acceptance** | Creator picks a bid after the window closes. Executor and accepted cost are recorded. | Yes |
-| **Execution** | Executor runs the SP1 zkVM off-chain: decrypts TLS records, parses the HTTP response, extracts the requested JSON field, and produces a Groth16 proof. | No |
-| **Verification** | Executor submits the proof on-chain. The Verifier contract checks it against a universal verification key. | Yes |
-| **Payout** | On success: executor receives `acceptedCost`, creator receives the surplus `(reward - acceptedCost)`. On failure: reward is locked for governance resolution. | Yes |
+A **schema** defines the exact HTTP request and JSON field extraction that an executor must perform to produce a valid zkTLS proof. Each task references a schema by its ID, and the executor's proof is verified against that schema's parameters. Schemas are registered on-chain and shared across tasks, so a single schema can be reused by any task creator.
+
+### Example: StarCount Schema
+
+A schema is defined as the set of **public inputs** to the zkTLS proof. These are the constraints the proof must satisfy to be considered valid. Below is an example schema for fetching a GitHub repository's star count:
+
+```json
+{
+  "schemaId": "starcount-v1",
+  "method": "GET",
+  "host": "api.github.com",
+  "port": 443,
+  "path": "/repos/{owner}/{repo}",
+  "headers": [
+    {
+      "key": "Accept",
+      "value": "application/vnd.github+json"
+    },
+    {
+      "key": "User-Agent",
+      "value": "zkTLS-agent/1.0"
+    }
+  ],
+  "jsonPath": "$.stargazers_count",
+  "expectedTlsVersion": "0x0303",
+  "serverCertHash": "sha256:abc123...",
+  "timestampRange": {
+    "min": 1718000000,
+    "max": 1718086400
+  },
+  "requestHash": "sha256:def456..."
+}
+```
+
+When a task uses this schema, the executor must connect to `api.github.com:443` over TLS, send the specified GET request, parse the JSON response, and extract the value at `$.stargazers_count`. The zkTLS proof attests that:
+
+- The TLS handshake used a certificate matching `serverCertHash`, proving the connection was with the real GitHub server.
+- The TLS session occurred within `timestampRange`, preventing replay of stale data.
+- The HTTP request sent matches `requestHash`, ensuring the executor didn't deviate from the schema.
+- The extracted value at `$.stargazers_count` is correct relative to the full response.
+
+All other data — the full HTTP response, API keys, and TLS session secrets — remain private.
 
 ---
 
