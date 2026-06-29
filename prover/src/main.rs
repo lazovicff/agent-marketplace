@@ -8,137 +8,16 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use num_bigint::BigUint;
-use num_traits::Zero;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use sp1_sdk::{
-    include_elf, utils, CpuProver, Elf, HashableKey, ProveRequest, Prover, ProvingKey,
-    SP1ProvingKey, SP1Stdin, SP1VerifyingKey,
+    include_elf, utils, CpuProver, Elf, HashableKey, MockProver, Prover, ProvingKey, SP1ProvingKey,
+    SP1Stdin, SP1VerifyingKey,
 };
 use std::path::PathBuf;
 use tls_capture::capture_tls_session;
 
 const ELF: Elf = include_elf!("zk-tls-program");
-
-// ============================================================
-//  Minimal DER Parser (for extracting cert signatures)
-// ============================================================
-
-struct DerReader<'a> {
-    data: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> DerReader<'a> {
-    fn new(data: &'a [u8]) -> Self {
-        Self { data, pos: 0 }
-    }
-    fn read_tag(&mut self) -> Option<(u8, &'a [u8])> {
-        if self.pos >= self.data.len() {
-            return None;
-        }
-        let tag = self.data[self.pos];
-        self.pos += 1;
-        if self.pos >= self.data.len() {
-            return None;
-        }
-        let len = if self.data[self.pos] & 0x80 != 0 {
-            let n = (self.data[self.pos] & 0x7f) as usize;
-            self.pos += 1;
-            let mut l = 0usize;
-            for _ in 0..n {
-                if self.pos >= self.data.len() {
-                    return None;
-                }
-                l = (l << 8) | self.data[self.pos] as usize;
-                self.pos += 1;
-            }
-            l
-        } else {
-            let l = self.data[self.pos] as usize;
-            self.pos += 1;
-            l
-        };
-        if self.pos + len > self.data.len() {
-            return None;
-        }
-        let val = &self.data[self.pos..self.pos + len];
-        self.pos += len;
-        Some((tag, val))
-    }
-}
-
-/// P-256 curve order n (big-endian).
-const P256_N: [u8; 32] = [
-    0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-    0xbc, 0xe6, 0xfa, 0xad, 0xa7, 0x17, 0x9e, 0x84, 0xf3, 0xb9, 0xca, 0xc2, 0xfc, 0x63, 0x25, 0x51,
-];
-
-/// Precompute modular inverses for ECDSA certs in the chain.
-/// For each cert, if it uses ECDSA P-256, extracts s from the signature and
-/// returns w = s⁻¹ mod n as 32-byte little-endian. For RSA certs, returns empty vec.
-fn precompute_inverses(cert_chain: &[Vec<u8>]) -> Vec<Vec<u8>> {
-    let n = BigUint::from_bytes_be(&P256_N);
-    cert_chain
-        .iter()
-        .map(|cert| {
-            // Parse outer SEQUENCE
-            let mut outer = match DerReader::new(cert) {
-                r if r.data.is_empty() => return vec![],
-                r => r,
-            };
-            let (_tag, _tbs) = match outer.read_tag() {
-                Some(v) => v,
-                None => return vec![],
-            };
-            // Skip signatureAlgorithm
-            let _ = outer.read_tag();
-            // Read signatureValue (BIT STRING)
-            let sig = match outer.read_tag() {
-                Some((_, v)) => v,
-                None => return vec![],
-            };
-            // BIT STRING: first byte is unused bits, rest is content
-            let sig_content = if sig.first() == Some(&0) {
-                &sig[1..]
-            } else {
-                sig
-            };
-            // Parse ECDSA signature: SEQUENCE { INTEGER r, INTEGER s }
-            let mut sig_rdr = DerReader::new(sig_content);
-            let (_tag, seq) = match sig_rdr.read_tag() {
-                Some(v) => v,
-                None => return vec![],
-            };
-            let mut inner = DerReader::new(seq);
-            let _r = match inner.read_tag() {
-                Some(v) => v.1,
-                None => return vec![],
-            };
-            let s_bytes = match inner.read_tag() {
-                Some(v) => v.1,
-                None => return vec![],
-            };
-            if s_bytes.is_empty() {
-                return vec![];
-            }
-            // Compute w = s⁻¹ mod n
-            let s = BigUint::from_bytes_be(s_bytes);
-            if s.is_zero() {
-                return vec![];
-            }
-            let w = s.modinv(&n).unwrap_or(BigUint::zero());
-            if w.is_zero() {
-                return vec![];
-            }
-            // Return as 32-byte little-endian
-            let mut w_le = w.to_bytes_le();
-            w_le.resize(32, 0);
-            w_le
-        })
-        .collect()
-}
 
 #[derive(Parser)]
 #[command(name = "amp-prover", about = "zkTLS Prover using SP1 zkVM")]
@@ -183,10 +62,6 @@ fn context_dir(output: &PathBuf, context: &str) -> PathBuf {
     output.join(context)
 }
 
-fn bytes_to_hex(bytes: &[u8]) -> String {
-    format!("0x{}", hex::encode(bytes))
-}
-
 async fn load_or_create_pk(prover: &CpuProver, ctx_dir: &PathBuf) -> Result<SP1ProvingKey> {
     let vk_path = ctx_dir.join("vk.bin");
     if vk_path.exists() {
@@ -224,6 +99,7 @@ async fn cmd_setup(output: &PathBuf, context: &str) -> Result<()> {
 
 async fn cmd_prove(output: &PathBuf, context: &str, url: &str, field: &str) -> Result<ProofData> {
     let ctx_dir = context_dir(output, context);
+    std::fs::create_dir_all(&ctx_dir)?;
     println!("=== Real zkTLS Proof ===");
     println!("URL:   {}", url);
     println!("Field: {}", field);
@@ -239,56 +115,41 @@ async fn cmd_prove(output: &PathBuf, context: &str, url: &str, field: &str) -> R
         session_data.server_cert_chain.len()
     );
 
-    let json: serde_json::Value = serde_json::from_str(&response_body)?;
-    let field_value = json
-        .get(field)
-        .and_then(|v| v.as_u64())
-        .with_context(|| format!("Field '{}' not found", field))?;
-    println!("  ✓ {} = {}", field, field_value);
-
-    println!("\n[2/3] Loading proving key...");
-    let prover = CpuProver::new().await;
-    let pk = load_or_create_pk(&prover, &ctx_dir).await?;
-
-    println!("\n[3/3] Generating Compressed proof...");
     let mut stdin = SP1Stdin::new();
     stdin.write(&session_data.encrypted_records);
     stdin.write(&session_data.server_handshake_traffic_secret);
     stdin.write(&session_data.server_application_traffic_secret);
     stdin.write(&session_data.server_cert_chain);
+
+    // Compute the expected root SPKI hash (SHA-256 of the last cert's SPKI DER)
+    let expected_root_spki_hash: [u8; 32] = {
+        let root_cert = session_data
+            .server_cert_chain
+            .last()
+            .expect("cert chain is empty");
+        let spki = extract_spki_der_host(root_cert).expect("failed to extract root SPKI");
+        sha2::Sha256::digest(&spki).into()
+    };
+    stdin.write(&expected_root_spki_hash);
+    println!("  ✓ root SPKI hash: {:02x?}", expected_root_spki_hash);
+
     stdin.write(&session_data.field_path);
     stdin.write(&session_data.server_name);
-    let full_response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{}",
-        response_body
-    );
-    stdin.write(&full_response.as_bytes().to_vec());
 
-    // Precompute modular inverses for ECDSA certs (avoid expensive bn_modinv in zkVM)
-    let precomputed_inverses = precompute_inverses(&session_data.server_cert_chain);
-    stdin.write(&precomputed_inverses);
+    println!("\n[2/3] Setting up MockProver for cycle count...");
+    let prover = MockProver::new().await;
+    let (mut pv, report) = prover.execute(ELF, stdin).await?;
+    println!("  ✓ Execution complete");
+    println!("  ✓ Total cycles: {}", report.total_instruction_count());
+    println!("  ✓ Syscall counts: {:?}", report.syscall_counts);
 
-    eprintln!(
-        "[TIMING] Starting prover.prove() at {:?}",
-        std::time::Instant::now()
-    );
-    let proof_with_inputs = prover.prove(&pk, stdin).compressed().await?;
-    eprintln!(
-        "[TIMING] prover.prove() done at {:?}",
-        std::time::Instant::now()
-    );
-    println!("  ✓ Proof generated");
-
-    println!("  ✓ Verifying proof...");
-    prover.verify(&proof_with_inputs, pk.verifying_key(), None)?;
-    println!("  ✓ Proof verified!");
-
-    // Serialize the full proof (Core mode: Vec<ShardProof>)
-    let proof_bytes =
-        bincode::serialize(&proof_with_inputs).context("Failed to serialize proof")?;
-    let proof_hex = bytes_to_hex(&proof_bytes);
-
-    let vk_hash = pk.verifying_key().bytes32();
+    // Read public values
+    let field_value: u64 = pv.read();
+    let server_name: String = pv.read();
+    let field_path: String = pv.read();
+    let _root_spki_hash: [u8; 32] = pv.read();
+    println!("  ✓ {} = {}", field_path, field_value);
+    println!("  ✓ Server: {}", server_name);
 
     let proof_data = ProofData {
         circuit: "sp1-zk-tls".to_string(),
@@ -303,21 +164,143 @@ async fn cmd_prove(output: &PathBuf, context: &str, url: &str, field: &str) -> R
         }),
         field_value: Some(field_value),
         body_hash: hex::encode(sha2::Sha256::digest(response_body.as_bytes())),
-        vk_hash,
-        proof_hex,
-        proof_length: proof_bytes.len(),
+        vk_hash: String::new(),
+        proof_hex: String::new(),
+        proof_length: 0,
     };
 
     let proof_path = ctx_dir.join("proof_data.json");
     let output_json = serde_json::to_string_pretty(&proof_data)?;
     std::fs::write(&proof_path, &output_json)?;
-    println!("  ✓ Proof saved to: {}", proof_path.display());
+    println!("  ✓ Data saved to: {}", proof_path.display());
 
-    println!("\n=== zkTLS Proof Generated ===");
-    println!("Field: {} = {}", field, field_value);
-    println!("Proof: {} bytes", proof_bytes.len());
+    println!("\n=== Cycle Count ===");
+    println!("Total cycles: {}", report.total_instruction_count());
 
     Ok(proof_data)
+}
+
+/// Skip a DER TLV (tag + length + value), advancing pos past the entire construct.
+fn skip_tlv(pos: &mut usize, data: &[u8]) -> Option<()> {
+    if *pos >= data.len() {
+        return None;
+    }
+    *pos += 1; // skip tag
+    if *pos >= data.len() {
+        return None;
+    }
+    if data[*pos] & 0x80 != 0 {
+        let n = (data[*pos] & 0x7f) as usize;
+        *pos += 1;
+        if *pos + n > data.len() {
+            return None;
+        }
+        let mut len = 0usize;
+        for _ in 0..n {
+            len = (len << 8) | data[*pos] as usize;
+            *pos += 1;
+        }
+        if *pos + len > data.len() {
+            return None;
+        }
+        *pos += len;
+    } else {
+        let len = data[*pos] as usize;
+        *pos += 1;
+        if *pos + len > data.len() {
+            return None;
+        }
+        *pos += len;
+    }
+    Some(())
+}
+
+/// Extract the full SPKI DER (including SEQUENCE tag and length) from a certificate.
+/// Returns None if the certificate can't be parsed.
+fn extract_spki_der_host(der: &[u8]) -> Option<Vec<u8>> {
+    let mut pos = 0;
+
+    // Read outer SEQUENCE (the whole certificate)
+    if pos >= der.len() || der[pos] != 0x30 {
+        return None;
+    }
+    let cert_start = pos;
+    skip_tlv(&mut pos, der)?;
+    let cert = &der[cert_start..pos];
+
+    // Skip the outer SEQUENCE tag and length to get to the contents
+    let mut inner = 1;
+    if inner >= cert.len() {
+        return None;
+    }
+    // Skip length (short or long form)
+    if cert[inner] & 0x80 != 0 {
+        inner += 1 + (cert[inner] & 0x7f) as usize;
+    } else {
+        inner += 1;
+    }
+
+    // Now at the TBS certificate (SEQUENCE)
+    if inner >= cert.len() || cert[inner] != 0x30 {
+        return None;
+    }
+    let tbs_start = inner;
+    skip_tlv(&mut inner, cert)?;
+    let tbs = &cert[tbs_start..inner];
+
+    // Skip the TBS SEQUENCE tag and length
+    let mut t = 1;
+    if t >= tbs.len() {
+        return None;
+    }
+    if tbs[t] & 0x80 != 0 {
+        t += 1 + (tbs[t] & 0x7f) as usize;
+    } else {
+        t += 1;
+    }
+
+    // Skip version [0] EXPLICIT if present (v2 or v3 certs)
+    if t < tbs.len() && tbs[t] == 0xa0 {
+        skip_tlv(&mut t, tbs)?;
+    }
+
+    // Skip serial number (INTEGER, tag 0x02)
+    if t >= tbs.len() || tbs[t] != 0x02 {
+        return None;
+    }
+    skip_tlv(&mut t, tbs)?;
+
+    // Skip signature algorithm (SEQUENCE, tag 0x30)
+    if t >= tbs.len() || tbs[t] != 0x30 {
+        return None;
+    }
+    skip_tlv(&mut t, tbs)?;
+
+    // Skip issuer (any constructed tag)
+    if t >= tbs.len() {
+        return None;
+    }
+    skip_tlv(&mut t, tbs)?;
+
+    // Skip validity (SEQUENCE, tag 0x30)
+    if t >= tbs.len() || tbs[t] != 0x30 {
+        return None;
+    }
+    skip_tlv(&mut t, tbs)?;
+
+    // Skip subject (any constructed tag)
+    if t >= tbs.len() {
+        return None;
+    }
+    skip_tlv(&mut t, tbs)?;
+
+    // The SPKI starts here (SEQUENCE, tag 0x30)
+    if t >= tbs.len() || tbs[t] != 0x30 {
+        return None;
+    }
+    let spki_start = t;
+    skip_tlv(&mut t, tbs)?;
+    Some(tbs[spki_start..t].to_vec())
 }
 
 #[tokio::main]

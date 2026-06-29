@@ -1,7 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["api", "cli", "prover", "prover/program", "prover/tls-capture"]
+members = ["prover", "prover/program", "prover/tls-capture"]
 
 [patch.crates-io]
 sha2 = { git = "https://github.com/sp1-patches/RustCrypto-hashes", package = "sha2", tag = "patch-sha2-0.10.8-sp1-6.2.0" }
 rsa = { git = "https://github.com/sp1-patches/RustCrypto-RSA", tag = "patch-0.9.6-sp1-6.2.0" }
+# Patched p256 routes ECDSA P-256 scalar multiplication through SP1's
+# secp256r1_add / secp256r1_double Weierstrass precompiles (via sp1-lib::ecdsa)
+# instead of pure-Rust field arithmetic. Major cycle reduction for cert-chain
+# verification. Matches the unpatched p256 0.13.2 API, so ecdsa.rs is unchanged.
+p256 = { git = "https://github.com/sp1-patches/elliptic-curves", tag = "patch-p256-13.2-sp1-6.2.0" }
