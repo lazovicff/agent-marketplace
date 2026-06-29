@@ -120,6 +120,19 @@ async fn cmd_prove(output: &PathBuf, context: &str, url: &str, field: &str) -> R
     stdin.write(&session_data.server_handshake_traffic_secret);
     stdin.write(&session_data.server_application_traffic_secret);
     stdin.write(&session_data.server_cert_chain);
+
+    // Compute the expected root SPKI hash (SHA-256 of the last cert's SPKI DER)
+    let expected_root_spki_hash: [u8; 32] = {
+        let root_cert = session_data
+            .server_cert_chain
+            .last()
+            .expect("cert chain is empty");
+        let spki = extract_spki_der_host(root_cert).expect("failed to extract root SPKI");
+        sha2::Sha256::digest(&spki).into()
+    };
+    stdin.write(&expected_root_spki_hash);
+    println!("  ✓ root SPKI hash: {:02x?}", expected_root_spki_hash);
+
     stdin.write(&session_data.field_path);
     stdin.write(&session_data.server_name);
     let full_response = format!(
@@ -146,6 +159,7 @@ async fn cmd_prove(output: &PathBuf, context: &str, url: &str, field: &str) -> R
     let field_value: u64 = pv.read();
     let server_name: String = pv.read();
     let field_path: String = pv.read();
+    let _root_spki_hash: [u8; 32] = pv.read();
     println!("  ✓ {} = {}", field_path, field_value);
     println!("  ✓ Server: {}", server_name);
 
@@ -176,6 +190,129 @@ async fn cmd_prove(output: &PathBuf, context: &str, url: &str, field: &str) -> R
     println!("Total cycles: {}", report.total_instruction_count());
 
     Ok(proof_data)
+}
+
+/// Skip a DER TLV (tag + length + value), advancing pos past the entire construct.
+fn skip_tlv(pos: &mut usize, data: &[u8]) -> Option<()> {
+    if *pos >= data.len() {
+        return None;
+    }
+    *pos += 1; // skip tag
+    if *pos >= data.len() {
+        return None;
+    }
+    if data[*pos] & 0x80 != 0 {
+        let n = (data[*pos] & 0x7f) as usize;
+        *pos += 1;
+        if *pos + n > data.len() {
+            return None;
+        }
+        let mut len = 0usize;
+        for _ in 0..n {
+            len = (len << 8) | data[*pos] as usize;
+            *pos += 1;
+        }
+        if *pos + len > data.len() {
+            return None;
+        }
+        *pos += len;
+    } else {
+        let len = data[*pos] as usize;
+        *pos += 1;
+        if *pos + len > data.len() {
+            return None;
+        }
+        *pos += len;
+    }
+    Some(())
+}
+
+/// Extract the full SPKI DER (including SEQUENCE tag and length) from a certificate.
+/// Returns None if the certificate can't be parsed.
+fn extract_spki_der_host(der: &[u8]) -> Option<Vec<u8>> {
+    let mut pos = 0;
+
+    // Read outer SEQUENCE (the whole certificate)
+    if pos >= der.len() || der[pos] != 0x30 {
+        return None;
+    }
+    let cert_start = pos;
+    skip_tlv(&mut pos, der)?;
+    let cert = &der[cert_start..pos];
+
+    // Skip the outer SEQUENCE tag and length to get to the contents
+    let mut inner = 1;
+    if inner >= cert.len() {
+        return None;
+    }
+    // Skip length (short or long form)
+    if cert[inner] & 0x80 != 0 {
+        inner += 1 + (cert[inner] & 0x7f) as usize;
+    } else {
+        inner += 1;
+    }
+
+    // Now at the TBS certificate (SEQUENCE)
+    if inner >= cert.len() || cert[inner] != 0x30 {
+        return None;
+    }
+    let tbs_start = inner;
+    skip_tlv(&mut inner, cert)?;
+    let tbs = &cert[tbs_start..inner];
+
+    // Skip the TBS SEQUENCE tag and length
+    let mut t = 1;
+    if t >= tbs.len() {
+        return None;
+    }
+    if tbs[t] & 0x80 != 0 {
+        t += 1 + (tbs[t] & 0x7f) as usize;
+    } else {
+        t += 1;
+    }
+
+    // Skip version [0] EXPLICIT if present (v2 or v3 certs)
+    if t < tbs.len() && tbs[t] == 0xa0 {
+        skip_tlv(&mut t, tbs)?;
+    }
+
+    // Skip serial number (INTEGER, tag 0x02)
+    if t >= tbs.len() || tbs[t] != 0x02 {
+        return None;
+    }
+    skip_tlv(&mut t, tbs)?;
+
+    // Skip signature algorithm (SEQUENCE, tag 0x30)
+    if t >= tbs.len() || tbs[t] != 0x30 {
+        return None;
+    }
+    skip_tlv(&mut t, tbs)?;
+
+    // Skip issuer (any constructed tag)
+    if t >= tbs.len() {
+        return None;
+    }
+    skip_tlv(&mut t, tbs)?;
+
+    // Skip validity (SEQUENCE, tag 0x30)
+    if t >= tbs.len() || tbs[t] != 0x30 {
+        return None;
+    }
+    skip_tlv(&mut t, tbs)?;
+
+    // Skip subject (any constructed tag)
+    if t >= tbs.len() {
+        return None;
+    }
+    skip_tlv(&mut t, tbs)?;
+
+    // The SPKI starts here (SEQUENCE, tag 0x30)
+    if t >= tbs.len() || tbs[t] != 0x30 {
+        return None;
+    }
+    let spki_start = t;
+    skip_tlv(&mut t, tbs)?;
+    Some(tbs[spki_start..t].to_vec())
 }
 
 #[tokio::main]

@@ -6,13 +6,13 @@
 //!   3. Verify TLS 1.3 CertificateVerify signature
 //!   4. Decrypt application data → parse HTTP → extract JSON field
 //!
-//! Only the field value, server name, and field path are revealed publicly.
-//!
-//! Uses SP1 precompiles: sha2 (SHA_EXTEND/COMPRESS) via patched sha2 crate.
-//! ECDSA verification uses the `k256` crate (pure Rust).
+//! Only the field value, server name, field path, and root SPKI hash
+//! are revealed publicly.
 
 #![no_main]
 sp1_zkvm::entrypoint!(main);
+
+use sha2::{Digest, Sha256};
 
 use crate::aes_256::aes256_gcm_decrypt;
 use crate::ecdsa::verify_ecdsa_p256;
@@ -20,7 +20,9 @@ use crate::tls_record::{
     parse_tls_records, TlsRecord, CONTENT_TYPE_APPLICATION_DATA, CONTENT_TYPE_HANDSHAKE,
     HANDSHAKE_TYPE_CERTIFICATE_VERIFY,
 };
-use crate::utils::{derive_key_iv, extract_json_field, parse_cert, parse_http_response};
+use crate::utils::{
+    derive_key_iv, extract_json_field, extract_spki_der, parse_cert, parse_http_response,
+};
 
 mod aes_256;
 mod ecdsa;
@@ -28,28 +30,40 @@ mod tls_record;
 mod utils;
 
 // ============================================================
-//  Cert Chain Verification (ECDSA P-256 only)
+//  Cert Chain Verification (ECDSA P-256 + Root SPKI pinning)
 // ============================================================
 
-fn verify_cert_chain(certs: &[Vec<u8>], _server_name: &str) -> bool {
+fn verify_cert_chain(certs: &[Vec<u8>], expected_root_spki_hash: &[u8; 32]) -> bool {
     if certs.is_empty() {
         return false;
     }
+    // Verify each cert against its issuer (except the root)
     for i in 0..certs.len() - 1 {
         let (_pubkey, sig, _issuer, _subject, tbs) = match parse_cert(&certs[i]) {
             Some(v) => v,
             None => return false,
         };
         // Try to parse the issuer's cert. If it's not P-256 (e.g. P-384 root),
-        // skip verification — the root is trusted by the system.
+        // skip signature verification — we verify the root via SPKI hash instead.
         let (next_pubkey, _, _, _, _) = match parse_cert(&certs[i + 1]) {
             Some(v) => v,
-            None => continue, // skip verification for non-P-256 issuers
+            None => continue,
         };
-        // Verify cert[i]'s signature using cert[i+1]'s (issuer's) public key
         if !verify_ecdsa_p256(&tbs, &sig, &next_pubkey.point) {
             return false;
         }
+    }
+    // Verify the root cert's SPKI hash matches the expected value (pinning)
+    if let Some(root_spki) = extract_spki_der(&certs[certs.len() - 1]) {
+        let root_hash = Sha256::digest(&root_spki);
+        let root_hash_arr: [u8; 32] = root_hash.into();
+        if root_hash_arr != *expected_root_spki_hash {
+            println!("verify_cert_chain: root SPKI hash mismatch");
+            return false;
+        }
+    } else {
+        println!("verify_cert_chain: failed to extract root SPKI");
+        return false;
     }
     true
 }
@@ -61,13 +75,13 @@ fn verify_cert_chain(certs: &[Vec<u8>], _server_name: &str) -> bool {
 fn verify_tls_handshake(
     handshake_records: &[Vec<u8>],
     server_cert_chain: &[Vec<u8>],
-    _server_name: &str,
+    expected_root_spki_hash: &[u8; 32],
 ) -> bool {
     if server_cert_chain.is_empty() {
         println!("verify_tls_handshake: empty cert chain");
         return false;
     }
-    if !verify_cert_chain(server_cert_chain, _server_name) {
+    if !verify_cert_chain(server_cert_chain, expected_root_spki_hash) {
         println!("verify_tls_handshake: cert chain verification failed");
         return false;
     }
@@ -153,6 +167,7 @@ pub fn main() {
     let server_hs_traffic_secret: Vec<u8> = sp1_zkvm::io::read();
     let server_app_traffic_secret: Vec<u8> = sp1_zkvm::io::read();
     let server_cert_chain: Vec<Vec<u8>> = sp1_zkvm::io::read();
+    let expected_root_spki_hash: [u8; 32] = sp1_zkvm::io::read();
     let field_path: String = sp1_zkvm::io::read();
     let server_name: String = sp1_zkvm::io::read();
     let response_body_fallback: Vec<u8> = sp1_zkvm::io::read();
@@ -260,6 +275,7 @@ pub fn main() {
     sp1_zkvm::io::commit(&field_value);
     sp1_zkvm::io::commit(&server_name);
     sp1_zkvm::io::commit(&field_path);
+    sp1_zkvm::io::commit(&expected_root_spki_hash);
 
     // ── Verify TLS handshake ────────────────────────────────────
     println!("Calling verify_tls_handshake...");
@@ -276,7 +292,11 @@ pub fn main() {
     for (i, c) in server_cert_chain.iter().enumerate() {
         println!("  cert[{}]: {} bytes", i, c.len());
     }
-    let result = verify_tls_handshake(&decrypted_handshake, &server_cert_chain, &server_name);
+    let result = verify_tls_handshake(
+        &decrypted_handshake,
+        &server_cert_chain,
+        &expected_root_spki_hash,
+    );
     println!("verify_tls_handshake result: {}", result);
     if !result {
         panic!("TLS handshake verification failed");

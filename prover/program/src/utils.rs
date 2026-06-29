@@ -67,6 +67,29 @@ pub fn parse_cert(der: &[u8]) -> Option<(CertPubkey, Vec<u8>, Vec<u8>, Vec<u8>, 
     ))
 }
 
+/// Extract the full SPKI DER (including SEQUENCE tag and length) from a certificate.
+/// Returns None if the certificate can't be parsed.
+pub fn extract_spki_der(der: &[u8]) -> Option<Vec<u8>> {
+    let mut outer = DerReader::new(der);
+    if outer.peek_tag() != 0x30 {
+        return None;
+    }
+    let mut cert = outer.read_seq();
+    let tbs_der = cert.read_tlv();
+    let mut tbs = DerReader::new(tbs_der);
+    let mut tbs = tbs.read_seq();
+    if tbs.peek_tag() == 0xa0 {
+        tbs.read_explicit_tag(0xa0);
+    }
+    let _serial = tbs.read_int();
+    let _sig_algo = tbs.read_seq();
+    let _issuer_der = tbs.read_tag().1;
+    let _validity = tbs.read_tag();
+    let _subject_der = tbs.read_tag().1;
+    // Read the full SPKI TLV (tag + length + value)
+    Some(tbs.read_tlv().to_vec())
+}
+
 // ============================================================
 //  ASN.1 DER Parser
 // ============================================================
